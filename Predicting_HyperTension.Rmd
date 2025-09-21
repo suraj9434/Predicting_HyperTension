@@ -1,0 +1,587 @@
+---
+title: "Predicting Hypertension (Framingham Study)"
+author: "Suraj Shrestha"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+## Project Overview
+Hypertension is a leading risk factor for cardiovascular disease.
+
+Using data from the Framingham Heart Study (n = 11,627), I developed predictive models to identify individuals at risk of prevalent hypertension (PREVHYP).
+
+This project highlights:
+
+- How to detect and correct data leakage
+
+- Application of Logistic Regression and Random Forests
+
+- Alignment of predictive insights with clinical knowledge
+
+## Data & Approach
+
+**Data Source:** Framingham Heart Study, longitudinal cardiovascular cohort.
+
+**Target Variable:** Prevalent hypertension (binary: 0/1).
+
+**Predictors:** Demographics, cholesterol, BMI, blood pressure, smoking, diabetes, etc.
+
+**Challenge:** Leakage variables (TIMEHYP, HYPERTEN, event times) initially led to artificially perfect models.
+
+**Solution:** Removed leakage, re-trained with 5-fold cross-validation.
+
+
+```{r, include=FALSE}
+# libraries
+library(tidyverse)
+library(tidymodels)   # recipes, workflows, tuning
+library(vip)          # variable importance
+library(pROC)         # ROC curves
+library(knitr)        # tables
+
+# For consistent classification metrics later (positive = second level)
+options(yardstick.event_first = "second")
+```
+
+
+```{r, include=FALSE}
+# Loading the frmgham dataset
+csv_path <- "~/Desktop/Data 520/HW/Hw 06 TidyModels/frmgham.csv"
+
+# Read CSV file and treat ".", "", and "NA" as missing
+frmgham_raw <- readr::read_csv(csv_path, na = c("", "NA", "."), show_col_types = FALSE)
+
+# Print number of rows and columns
+cat("Rows:", nrow(frmgham_raw), "  Cols:", ncol(frmgham_raw), "\n\n")
+```
+
+```{r, include=FALSE}
+# glance at the dataset
+head(frmgham_raw)
+
+```
+
+```{r, include=FALSE}
+# Make sure PREVHYP is a factor with levels 0 and 1
+frmgham_raw$PREVHYP <- as.factor(frmgham_raw$PREVHYP)
+
+# Show levels and counts
+cat("\nLevels in PREVHYP:", paste(levels(frmgham_raw$PREVHYP), collapse = ", "), "\n")
+print(table(frmgham_raw$PREVHYP, useNA = "ifany"))
+
+# Find character columns
+char_cols <- names(frmgham_raw)[sapply(frmgham_raw, is.character)]
+cat("\nCharacter columns detected:\n")
+print(char_cols)
+
+# Rename dataset for convenience
+frmgham <- frmgham_raw
+
+```
+
+```{r, include=FALSE}
+# Type fixes + target prep
+ 
+library(forcats)
+
+# 1) Drop row-index column if present (often named "...1")
+if ("...1" %in% names(frmgham)) {
+  frmgham <- frmgham %>% select(-`...1`)
+}
+
+# 2) Ensure these are numeric (to be safe even if already numeric)
+num_maybe_chr <- intersect(names(frmgham),
+                           c("TOTCHOL","CIGPDAY","BMI","GLUCOSE","HDLC","LDLC"))
+frmgham <- frmgham %>% mutate(across(all_of(num_maybe_chr), as.numeric))
+
+# 3) Convert binary/categorical variables to factors
+factor_vars <- intersect(
+  names(frmgham),
+  c("SEX","PERIOD","BPMEDS","CURSMOKE","DIABETES","PREVHYP",
+    "PREVCHD","PREVAP","PREVMI","PREVSTRK","ANGINA","HOSPMI",
+    "MI_FCHD","ANYCHD","STROKE","CVD","HYPERTEN","DEATH")
+)
+frmgham <- frmgham %>% 
+  mutate(across(all_of(factor_vars), as.factor))
+
+# 4) Make sure PREVHYP levels are "0","1" with "1" as the event (second level)
+frmgham <- frmgham %>%
+  mutate(
+    PREVHYP = fct_drop(PREVHYP),
+    PREVHYP = fct_relevel(PREVHYP, "0", "1")
+  )
+
+# 5) Build modeling frame: drop clear identifiers
+prevhyp_data <- frmgham %>%
+  select(-any_of(c("RANDID"))) %>%
+  drop_na(PREVHYP)
+
+# 6) Quick sanity checks
+cat("Levels(PREVHYP):", paste(levels(prevhyp_data$PREVHYP), collapse = ", "), "\n")
+print(table(prevhyp_data$PREVHYP, useNA = "ifany"))
+
+cat("\nMissing values (any column):", sum(!complete.cases(prevhyp_data)), "\n")
+
+```
+
+## Model 1 (Before Fixing Leakage)
+```{r, include=FALSE}
+# Split + Recipe -----------------------------------------------
+
+# Split into train/test with stratification
+set.seed(2025)
+split <- initial_split(prevhyp_data, strata = PREVHYP, prop = 0.8)
+train <- training(split)
+test  <- testing(split)
+
+cat("Train size:", nrow(train), " Test size:", nrow(test), "\n")
+
+# Recipe: preprocessing pipeline
+rec <- recipe(PREVHYP ~ ., data = train) %>%
+  
+  # Handle missing values
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # Encode categoricals
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # Remove uninformative vars
+  step_zv(all_predictors()) %>%
+  
+  # Normalize numeric vars
+  step_normalize(all_numeric_predictors())
+
+# Prep recipe and inspect
+rec_prep <- prep(rec)
+train_baked <- bake(rec_prep, new_data = NULL)
+
+cat("Processed train shape:", dim(train_baked)[1], "rows x", dim(train_baked)[2], "cols\n")
+
+```
+
+```{r, include=FALSE}
+# Models + Workflows
+
+# Logistic Regression (glmnet, L1 regularization)
+logistic_mod <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Random Forest
+rf_mod <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Workflows (recipe + model)
+log_wf <- workflow() %>% add_recipe(rec) %>% add_model(logistic_mod)
+rf_wf  <- workflow() %>% add_recipe(rec) %>% add_model(rf_mod)
+
+cat("Workflows ready: logistic, RF\n")
+```
+
+
+```{r, include=FALSE}
+# Cross-validation + Parameter Grids
+
+set.seed(2025)
+folds <- vfold_cv(train, v = 5, strata = PREVHYP)
+cat("Created", length(folds$splits), "-fold cross-validation\n")
+
+# Extract parameter sets
+log_params <- extract_parameter_set_dials(log_wf)
+rf_params  <- extract_parameter_set_dials(rf_wf)
+
+# Finalize RF parameters (mtry depends on predictors)
+rf_params <- rf_params %>% finalize(train)
+
+# Update logistic penalty range (1e-4 to 1)
+log_params <- log_params %>%
+  update(penalty = penalty(range = c(-4, 0)))
+
+# Create grids
+set.seed(2025)
+log_grid <- grid_regular(log_params, levels = 20)
+rf_grid  <- grid_space_filling(rf_params, size = 20)
+
+cat("Grids created: logistic =", nrow(log_grid),
+    ", RF =", nrow(rf_grid), "\n")
+
+```
+
+```{r, include=FALSE}
+# Tune Logistic + RF 
+library(yardstick)
+
+# Metric set
+metric_fn <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::roc_auc,
+  yardstick::sens,
+  yardstick::spec,
+  yardstick::f_meas
+)
+
+# Logistic Regression tuning
+log_res <- tune_grid(
+  log_wf,
+  resamples = folds,
+  grid = log_grid,
+  metrics = metric_fn
+)
+
+# Random Forest tuning
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_fn
+)
+
+cat("Tuning finished for logistic and RF\n")
+
+
+```
+
+```{r, include=FALSE}
+# Select Best Params + Fit Final Models (fixed)
+
+# Select best params based on ROC AUC
+best_log <- select_best(log_res, metric = "roc_auc")
+best_rf  <- select_best(rf_res,  metric = "roc_auc")
+
+cat("Best Logistic Regression params:\n")
+print(best_log)
+
+cat("\nBest Random Forest params:\n")
+print(best_rf)
+
+# Finalize workflows
+final_log <- finalize_workflow(log_wf, best_log)
+final_rf  <- finalize_workflow(rf_wf,  best_rf)
+
+# Fit final models on training data
+log_fit <- fit(final_log, data = train)
+rf_fit  <- fit(final_rf,  data = train)
+
+cat("\nFinal models trained on full training data.\n")
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Evaluate Final Models on Test Set
+library(yardstick)
+library(vip)
+library(pROC)
+
+# Helper function for metrics
+eval_metrics <- function(fit, name) {
+  preds <- predict(fit, test, type = "prob") %>%
+    bind_cols(predict(fit, test, type = "class")) %>%
+    bind_cols(test %>% select(PREVHYP)) %>%
+    rename(.pred_class = .pred_class)
+
+  tibble(
+    model    = name,
+    accuracy = accuracy(preds, truth = PREVHYP, estimate = .pred_class)$.estimate,
+    roc_auc  = roc_auc(preds, truth = PREVHYP, .pred_1, event_level = "second")$.estimate,
+    sens     = sens(preds, truth = PREVHYP, estimate = .pred_class, event_level = "second")$.estimate,
+    spec     = spec(preds, truth = PREVHYP, estimate = .pred_class, event_level = "second")$.estimate,
+    f1       = f_meas(preds, truth = PREVHYP, estimate = .pred_class, event_level = "second")$.estimate
+  )
+}
+
+# Collect results
+results <- bind_rows(
+  eval_metrics(log_fit, "Logistic Regression"),
+  eval_metrics(rf_fit,  "Random Forest")
+)
+
+print(results)
+```
+
+Before fixing leakage, both Logistic Regression and Random Forest models appear to have perfect performance — with accuracy, AUC, sensitivity, specificity, and F1 all at or near 1.0 (100%). At first glance, this might look ideal, but in reality it signals a serious problem: the models were using leakage variables (like TIMEHYP and HYPERTEN) that directly reveal the outcome. Because of this, the models essentially memorized the target instead of learning real predictive patterns.
+
+
+```{r,echo=FALSE, warning=FALSE, message=FALSE}
+# ROC Curves (from pROC)
+log_probs <- predict(log_fit, test, type = "prob")$.pred_1
+rf_probs  <- predict(rf_fit,  test, type = "prob")$.pred_1
+
+roc_log <- roc(response = test$PREVHYP, predictor = log_probs, levels = c("0","1"))
+roc_rf  <- roc(response = test$PREVHYP, predictor = rf_probs,  levels = c("0","1"))
+
+plot(roc_log, col = "blue", lwd = 2, main = "ROC Curves (Test Set)")
+plot(roc_rf,  col = "red",  add = TRUE, lwd = 2)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic AUC = ", round(auc(roc_log),3)),
+         paste0("Random Forest AUC = ", round(auc(roc_rf),3))
+       ),
+       col = c("blue","red"), lwd = 2)
+
+```
+
+This ROC curve also shows that both Logistic Regression and Random Forest achieved an AUC of 1.0 before fixing leakage. On the plot, the lines shoot straight up and across the top border, which is a textbook sign of perfect separation between classes. While this might look impressive, it is not realistic — it confirms that the models were relying on leakage variables that directly encoded the outcome.
+
+## Model 2 (After Fixing Leakage)
+```{r, include=FALSE}
+# (Leakage Fix) — Drop future/outcome-related variables
+
+# Variables to drop (future info / tautology)
+leakage_vars <- c("TIME", "TIMEAP", "TIMEMI", "TIMEMIFC", "TIMECHD", 
+                  "TIMESTRK", "TIMECVD", "TIMEDTH", "TIMEHYP", 
+                  "HYPERTEN") 
+
+# Create modeling dataset with only baseline predictors
+prevhyp_data_clean <- frmgham %>%
+  select(-any_of(c("RANDID", leakage_vars))) %>%
+  drop_na(PREVHYP)
+
+cat("Original dataset cols:", ncol(frmgham), 
+    " | After cleaning:", ncol(prevhyp_data_clean), "\n")
+
+```
+
+```{r, include=FALSE}
+
+# (Clean) — Split + Recipe
+# ================================
+
+set.seed(2025)
+split <- initial_split(prevhyp_data_clean, strata = PREVHYP, prop = 0.8)
+train <- training(split)
+test  <- testing(split)
+
+cat("Train size:", nrow(train), " Test size:", nrow(test), "\n")
+
+# Recipe: preprocessing
+rec <- recipe(PREVHYP ~ ., data = train) %>%
+  # Handle missing values
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  # Encode categoricals
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  # Remove uninformative vars
+  step_zv(all_predictors()) %>%
+  # Normalize numeric vars
+  step_normalize(all_numeric_predictors())
+
+# Prep recipe and inspect
+rec_prep <- prep(rec)
+train_baked <- bake(rec_prep, new_data = NULL)
+
+cat("Processed train shape:", dim(train_baked)[1], "rows x", dim(train_baked)[2], "cols\n")
+
+```
+
+```{r, include=FALSE}
+# (Clean) — Models + Workflows
+
+# Logistic Regression (glmnet)
+logistic_mod <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Random Forest
+rf_mod <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Workflows
+log_wf <- workflow() %>% add_recipe(rec) %>% add_model(logistic_mod)
+rf_wf  <- workflow() %>% add_recipe(rec) %>% add_model(rf_mod)
+
+cat("Workflows ready: logistic, RF\n")
+
+```
+
+```{r, include=FALSE}
+
+# (Clean) — Cross-validation + Grids
+
+set.seed(2025)
+folds <- vfold_cv(train, v = 5, strata = PREVHYP)
+cat("Created", length(folds$splits), "-fold CV\n")
+
+# Parameter sets
+log_params <- extract_parameter_set_dials(log_wf)
+rf_params  <- extract_parameter_set_dials(rf_wf)
+
+# Finalize RF params
+rf_params <- rf_params %>% finalize(train)
+
+# Adjust logistic penalty range
+log_params <- log_params %>%
+  update(penalty = penalty(range = c(-4, 0)))
+
+# Create grids
+set.seed(2025)
+log_grid <- grid_regular(log_params, levels = 15)
+rf_grid  <- grid_space_filling(rf_params, size = 15)
+
+cat("Grids created: logistic =", nrow(log_grid),
+    ", RF =", nrow(rf_grid), "\n")
+
+```
+
+```{r, include=FALSE}
+# (Clean) — Tune Logistic + RF
+
+metric_fn <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::roc_auc,
+  yardstick::sens,
+  yardstick::spec,
+  yardstick::f_meas
+)
+
+# Logistic Regression tuning
+log_res <- tune_grid(
+  log_wf,
+  resamples = folds,
+  grid = log_grid,
+  metrics = metric_fn
+)
+
+# Random Forest tuning
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = metric_fn
+)
+
+cat("Tuning finished for logistic and RF (clean dataset)\n")
+
+```
+
+
+```{r, include=FALSE}
+
+# (Clean) — Select Best + Fit Final Models
+
+best_log <- select_best(log_res, metric = "roc_auc")
+best_rf  <- select_best(rf_res,  metric = "roc_auc")
+
+cat("Best Logistic Regression params:\n")
+print(best_log)
+
+cat("\nBest Random Forest params:\n")
+print(best_rf)
+
+# Finalize workflows
+final_log <- finalize_workflow(log_wf, best_log)
+final_rf  <- finalize_workflow(rf_wf,  best_rf)
+
+# Fit final models
+log_fit <- fit(final_log, data = train)
+rf_fit  <- fit(final_rf,  data = train)
+
+cat("\nFinal models trained on cleaned dataset.\n")
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+# (Clean, with Plots) — Evaluate + Visualize
+
+library(pROC)
+library(vip)
+
+# ---- Metrics function (same as before)
+eval_metrics <- function(fit, name) {
+  preds <- predict(fit, test, type = "prob") %>%
+    bind_cols(predict(fit, test, type = "class")) %>%
+    bind_cols(test %>% select(PREVHYP)) %>%
+    rename(.pred_class = .pred_class)
+
+  tibble(
+    model    = name,
+    accuracy = accuracy(preds, truth = PREVHYP, estimate = .pred_class)$.estimate,
+    roc_auc  = roc_auc(preds, truth = PREVHYP, .pred_1, event_level = "second")$.estimate,
+    sens     = sens(preds, truth = PREVHYP, estimate = .pred_class, event_level = "second")$.estimate,
+    spec     = spec(preds, truth = PREVHYP, estimate = .pred_class, event_level = "second")$.estimate,
+    f1       = f_meas(preds, truth = PREVHYP, estimate = .pred_class, event_level = "second")$.estimate
+  )
+}
+
+# ---- Collect metrics
+results_clean <- bind_rows(
+  eval_metrics(log_fit, "Logistic Regression"),
+  eval_metrics(rf_fit,  "Random Forest")
+)
+
+print(results_clean)
+
+
+```
+
+After removing leakage variables, both models achieved strong and realistic performance. Logistic Regression reached ~87% accuracy with an AUC of 0.94, while Random Forest slightly outperformed it with ~88% accuracy and a similar AUC. Sensitivity and specificity were both high (≥84% and ≥88%), showing the models reliably detected hypertensive patients while minimizing false positives. Overall, Random Forest offered slightly better balance, but Logistic Regression remains valuable for interpretability. These results confirm that the corrected models are both robust and clinically meaningful.
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# ROC Curves
+log_probs <- predict(log_fit, test, type = "prob")$.pred_1
+rf_probs  <- predict(rf_fit,  test, type = "prob")$.pred_1
+
+roc_log <- roc(response = test$PREVHYP, predictor = log_probs, levels = c("0","1"))
+roc_rf  <- roc(response = test$PREVHYP, predictor = rf_probs,  levels = c("0","1"))
+
+plot(roc_log, col = "blue", lwd = 2, main = "ROC Curves (Clean Dataset)")
+plot(roc_rf,  col = "red",  add = TRUE, lwd = 2)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic AUC = ", round(auc(roc_log),3)),
+         paste0("Random Forest AUC = ", round(auc(roc_rf),3))
+       ),
+       col = c("blue","red"), lwd = 2)
+```
+
+
+The ROC curves show that both Logistic Regression (AUC = 0.939) and Random Forest (AUC = 0.943) perform exceptionally well in distinguishing between hypertensive and non-hypertensive patients. The curves closely follow the top-left corner, indicating that both models achieve high sensitivity and specificity across decision thresholds. Random Forest demonstrates a slight edge in discrimination, but the difference is marginal, and both models are strong performers. Importantly, unlike the artificially perfect results seen before correcting for leakage, these AUC values are realistic and generalizable, confirming that the models provide valid and clinically meaningful predictions.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Random Forest Variable Importance
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 15) +
+  ggtitle("Random Forest Variable Importance (Top 15 Predictors)")
+
+```
+
+This variable importance plot shows which factors are most important for predicting hypertension. The top predictors are systolic blood pressure (SYSBP) and diastolic blood pressure (DIABP), which makes sense because they directly measure blood pressure. Other important factors include blood pressure medication use, age, and BMI, all known risk factors for hypertension. Cholesterol, heart rate, and glucose also play smaller roles. Overall, the model highlights the same risk factors doctors use in practice, showing that the results are both valid and meaningful.
+
+
+### Conclusion
+
+Before fixing leakage, both Logistic Regression and Random Forest appeared to achieve perfect accuracy and AUC (1.0) — results that looked impressive but were unrealistic because the models had access to outcome-related variables. Once those leakage variables (e.g., TIMEHYP, HYPERTEN) were removed, performance dropped to more credible levels:
+
+**Logistic Regression: Accuracy = ~87%, AUC = 0.939**
+
+**Random Forest: Accuracy = ~88%, AUC = 0.943**
+
+These results are both strong and consistent with real-world clinical understanding. The most important predictors were systolic and diastolic blood pressure, followed by age, BMI, and medication use, which are well-established risk factors for hypertension.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
